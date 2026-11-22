@@ -57,6 +57,25 @@ export interface AppDatabaseState {
 
 const LOCAL_STORAGE_KEY = 'SR_GROUP_DB_CACHE';
 
+// Server-verified Bearer token kept strictly in JS memory (never localStorage/sessionStorage)
+let activeAuthToken: string | null = null;
+
+export function setAuthToken(token: string | null) {
+  activeAuthToken = token;
+}
+
+export function getAuthToken(): string | null {
+  return activeAuthToken;
+}
+
+function getAuthHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...(extra || {}) };
+  if (activeAuthToken) {
+    headers['Authorization'] = `Bearer ${activeAuthToken}`;
+  }
+  return headers;
+}
+
 export function getUserStorageKey(email?: string): string {
   if (!email || !email.trim()) return LOCAL_STORAGE_KEY;
   return `SR_GROUP_USER_DATA_${email.toLowerCase().trim().replace(/[^a-z0-9_.-]/g, '_')}`;
@@ -64,13 +83,10 @@ export function getUserStorageKey(email?: string): string {
 
 export function getLocalCache(email?: string): AppDatabaseState | null {
   try {
+    if (!email || !email.trim()) return null;
     const key = getUserStorageKey(email);
     const raw = localStorage.getItem(key);
     if (raw) return JSON.parse(raw);
-    if (email) {
-      const fallback = localStorage.getItem(LOCAL_STORAGE_KEY);
-      if (fallback) return JSON.parse(fallback);
-    }
   } catch (e) {
     console.error('Failed reading local cache:', e);
   }
@@ -79,9 +95,9 @@ export function getLocalCache(email?: string): AppDatabaseState | null {
 
 export function saveLocalCache(state: AppDatabaseState, email?: string) {
   try {
+    if (!email || !email.trim()) return;
     const key = getUserStorageKey(email);
     localStorage.setItem(key, JSON.stringify(state));
-    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state));
   } catch (e) {
     console.error('Failed saving local cache:', e);
   }
@@ -106,12 +122,93 @@ export const initialFullState: AppDatabaseState = {
   formula_settings: INITIAL_FORMULA_SETTINGS,
 };
 
+export interface AuthResponse {
+  user: User;
+  token: string;
+}
+
+export async function apiAuthRegister(payload: {
+  name: string;
+  email: string;
+  password: string;
+  role: UserRole;
+  provider?: 'password' | 'google';
+  securityQuestion: string;
+  securityAnswer: string;
+}): Promise<AuthResponse> {
+  const res = await fetch('/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data?.error || 'Registration failed. Please check your details.');
+  }
+  return data as AuthResponse;
+}
+
+export async function apiAuthLogin(payload: {
+  email: string;
+  password: string;
+}): Promise<AuthResponse> {
+  const res = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data?.error || 'Invalid email or password.');
+  }
+  return data as AuthResponse;
+}
+
+export interface ForgotLookupResponse {
+  email: string;
+  name: string;
+  securityQuestion: string;
+}
+
+export async function apiAuthForgotLookup(email: string): Promise<ForgotLookupResponse> {
+  const res = await fetch('/api/auth/forgot-password/lookup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data?.error || 'Unable to look up account for password recovery.');
+  }
+  return data as ForgotLookupResponse;
+}
+
+export async function apiAuthResetPassword(payload: {
+  email: string;
+  securityAnswer: string;
+  newPassword: string;
+}): Promise<{ success: boolean; message: string }> {
+  const res = await fetch('/api/auth/forgot-password/reset', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data?.error || 'Unable to reset password.');
+  }
+  return data as { success: boolean; message: string };
+}
+
 // API Client with fallbacks and per-user email isolation
 export async function syncFromServer(email?: string): Promise<AppDatabaseState> {
   try {
-    const url = email && email.trim() ? `/api/sync?email=${encodeURIComponent(email.trim())}` : '/api/sync';
-    const res = await fetch(url, {
-      headers: email ? { 'x-user-email': email } : {},
+    if (!activeAuthToken) {
+      const cached = getLocalCache(email);
+      return cached || initialFullState;
+    }
+    const res = await fetch('/api/sync', {
+      headers: getAuthHeaders(),
     });
     if (res.ok) {
       const data = await res.json();
@@ -135,14 +232,12 @@ export async function syncFromServer(email?: string): Promise<AppDatabaseState> 
 
 export async function saveUserFullStateToServer(email: string, state: AppDatabaseState): Promise<void> {
   saveLocalCache(state, email);
+  if (!activeAuthToken) return;
   try {
     await fetch('/api/user-sync', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-user-email': email,
-      },
-      body: JSON.stringify({ email, data: state }),
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ data: state }),
     });
   } catch (e) {
     console.warn('Server sync background save error:', e);
@@ -151,20 +246,22 @@ export async function saveUserFullStateToServer(email: string, state: AppDatabas
 
 export async function apiSaveRecord<T>(collection: string, record: Partial<T> & { id?: string }): Promise<T> {
   try {
-    if (record.id && !record.id.startsWith('temp-')) {
-      const res = await fetch(`/api/${collection}/${record.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(record),
-      });
-      if (res.ok) return await res.json();
-    } else {
-      const res = await fetch(`/api/${collection}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(record),
-      });
-      if (res.ok) return await res.json();
+    if (activeAuthToken) {
+      if (record.id && !record.id.startsWith('temp-')) {
+        const res = await fetch(`/api/${collection}/${record.id}`, {
+          method: 'PUT',
+          headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(record),
+        });
+        if (res.ok) return await res.json();
+      } else {
+        const res = await fetch(`/api/${collection}`, {
+          method: 'POST',
+          headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(record),
+        });
+        if (res.ok) return await res.json();
+      }
     }
   } catch (err) {
     console.warn(`Failed saving to server for ${collection}:`, err);
@@ -179,8 +276,10 @@ export async function apiSaveRecord<T>(collection: string, record: Partial<T> & 
 
 export async function apiDeleteRecord(collection: string, id: string): Promise<boolean> {
   try {
+    if (!activeAuthToken) return false;
     const res = await fetch(`/api/${collection}/${id}`, {
       method: 'DELETE',
+      headers: getAuthHeaders(),
     });
     return res.ok;
   } catch (err) {
@@ -191,9 +290,10 @@ export async function apiDeleteRecord(collection: string, id: string): Promise<b
 
 export async function apiBulkAttendance(records: AttendanceRecord[]): Promise<boolean> {
   try {
+    if (!activeAuthToken) return false;
     const res = await fetch('/api/attendance/bulk', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(records),
     });
     return res.ok;
@@ -205,15 +305,14 @@ export async function apiBulkAttendance(records: AttendanceRecord[]): Promise<bo
 
 export async function apiResetDatabase(state: AppDatabaseState): Promise<boolean> {
   try {
+    if (!activeAuthToken) return false;
     const res = await fetch('/api/reset-data', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(state),
     });
-    saveLocalCache(state);
     return res.ok;
   } catch (err) {
-    saveLocalCache(state);
     return false;
   }
 }

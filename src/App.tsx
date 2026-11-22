@@ -29,6 +29,7 @@ import {
   initialFullState,
   saveLocalCache,
   saveUserFullStateToServer,
+  setAuthToken,
   AppDatabaseState,
 } from './lib/storage';
 import { calculateProfitLossSummary } from './lib/calculations';
@@ -83,37 +84,23 @@ export default function App() {
   );
   const [selectedBillForDetails, setSelectedBillForDetails] = useState<MeasurementBill | null>(null);
 
-  // Active session and authentication
-  const [currentUser, setCurrentUser] = useState<User>(() => {
-    try {
-      const stored = localStorage.getItem('SR_ACTIVE_AUTH_USER');
-      if (stored) return JSON.parse(stored);
-    } catch (e) {
-      console.warn('Failed reading auth user cache:', e);
+  // Active session and authentication (token held strictly in React/JS memory)
+  const [currentUser, setCurrentUser] = useState<User>(
+    initialFullState.users[0] || {
+      id: 'usr-admin-1',
+      name: 'S.R. Khan',
+      email: '',
+      role: 'ADMIN',
+      status: 'Active',
+      createdAt: '2026-01-01',
     }
-    return (
-      initialFullState.users[0] || {
-        id: 'usr-admin-1',
-        name: 'S.R. Khan',
-        email: 'srkhan@srgroup.com',
-        role: 'ADMIN',
-        status: 'Active',
-        createdAt: '2026-01-01',
-      }
-    );
-  });
+  );
 
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    try {
-      return !!localStorage.getItem('SR_ACTIVE_AUTH_USER');
-    } catch {
-      return false;
-    }
-  });
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
 
   const [currentTab, setCurrentTab] = useState<NavTab>('dashboard');
   const [isMobileNavOpen, setIsMobileNavOpen] = useState(false);
-  const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [isInitialLoading, setIsInitialLoading] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
   // Global Filter State (Section 4 & 5)
@@ -147,6 +134,7 @@ export default function App() {
 
   // Re-sync ERP data from server for the active user
   const handleRefreshData = async () => {
+    if (!isAuthenticated) return;
     setIsRefreshing(true);
     try {
       const fullState = await syncFromServer(currentUser?.email);
@@ -160,15 +148,11 @@ export default function App() {
     }
   };
 
-  // Handle User Login
-  const handleLogin = async (user: User) => {
+  // Handle Verified User Login
+  const handleLogin = async (user: User, token: string) => {
+    setAuthToken(token);
     setCurrentUser(user);
     setIsAuthenticated(true);
-    try {
-      localStorage.setItem('SR_ACTIVE_AUTH_USER', JSON.stringify(user));
-    } catch (e) {
-      console.warn('Failed saving auth user:', e);
-    }
     setIsRefreshing(true);
     try {
       const fullState = await syncFromServer(user.email);
@@ -184,29 +168,24 @@ export default function App() {
 
   // Handle User Logout
   const handleLogout = () => {
+    setAuthToken(null);
     try {
       localStorage.removeItem('SR_ACTIVE_AUTH_USER');
-    } catch (e) {
-      console.warn('Failed clearing auth session:', e);
+    } catch {
+      // ignore storage errors
     }
+    applyStateToComponents(initialFullState);
     setIsAuthenticated(false);
   };
 
-  // Fetch initial data from Express backend on mount
+  // Clear any legacy unverified auth cache on mount
   useEffect(() => {
-    async function loadBackendData() {
-      try {
-        const fullState = await syncFromServer(currentUser?.email);
-        if (fullState) {
-          applyStateToComponents(fullState);
-        }
-      } catch (err) {
-        console.error('Failed loading ERP state:', err);
-      } finally {
-        setIsInitialLoading(false);
-      }
+    try {
+      localStorage.removeItem('SR_ACTIVE_AUTH_USER');
+    } catch {
+      // ignore
     }
-    loadBackendData();
+    setIsInitialLoading(false);
   }, []);
 
   // Filter change handler
